@@ -3,10 +3,11 @@ import json
 import base64
 import hashlib
 import os
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from urllib.parse import parse_qs, unquote, urlparse
 
 import joblib
 import matplotlib
@@ -14,10 +15,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pymysql
+from pymysql.cursors import DictCursor
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from core import clean_commodity_series, descriptive_analysis, train_model
+from core import (
+    MODEL_DIR,
+    MAX_LAG,
+    clean_commodity_series,
+    descriptive_analysis,
+    make_time_series_features,
+    parse_date_series,
+    train_model,
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -28,36 +39,83 @@ _lock = threading.Lock()
 _PLACEHOLDER_COLUMNS = {"_dummy_", "dummy", ""}
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 ACTIVE_DATASET_PATH = os.path.join(DATA_DIR, "active_dataset.json")
-DATABASE_PATH = os.path.join(DATA_DIR, "pangancast.db")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
+class _DatabaseConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, parameters=()):
+        cursor = self.connection.cursor()
+        cursor.execute(query.replace("?", "%s"), parameters)
+        return cursor
+
+
+@contextmanager
 def _db():
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL MySQL belum dikonfigurasi.")
+    parsed = urlparse(database_url)
+    if parsed.scheme not in {"mysql", "mysql+pymysql"}:
+        raise RuntimeError("DATABASE_URL harus menggunakan MySQL.")
+    query = parse_qs(parsed.query)
+    ssl_ca = os.environ.get("MYSQL_SSL_CA") or query.get("ssl_ca", [None])[0]
+    ssl_options = {"ca": ssl_ca} if ssl_ca else {}
+    connection = pymysql.connect(
+        host=parsed.hostname,
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        database=unquote(parsed.path.lstrip("/")),
+        charset="utf8mb4",
+        cursorclass=DictCursor,
+        connect_timeout=10,
+        ssl=ssl_options,
+    )
+    try:
+        yield _DatabaseConnection(connection)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _init_database():
     with _db() as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS training_sessions (
-                id TEXT PRIMARY KEY,
-                dataset_name TEXT NOT NULL,
-                dataset_hash TEXT NOT NULL,
-                parameters TEXT NOT NULL,
-                result TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                is_selected INTEGER NOT NULL DEFAULT 0
+                id VARCHAR(36) PRIMARY KEY,
+                model_name VARCHAR(255) NOT NULL,
+                dataset_name VARCHAR(255) NOT NULL,
+                dataset_hash VARCHAR(64) NOT NULL,
+                parameters LONGTEXT NOT NULL,
+                result LONGTEXT NOT NULL,
+                created_at VARCHAR(40) NOT NULL,
+                is_selected TINYINT(1) NOT NULL DEFAULT 0
             )
         """)
+        columns = connection.execute("SHOW COLUMNS FROM training_sessions").fetchall()
+        column_names = {column["Field"] for column in columns}
+        if "model_name" not in column_names:
+            connection.execute(
+                "ALTER TABLE training_sessions ADD COLUMN model_name VARCHAR(255) "
+                "NOT NULL DEFAULT 'Model tersimpan'"
+            )
         if connection.execute(
             "SELECT 1 FROM training_sessions WHERE is_selected = 1 LIMIT 1"
         ).fetchone() is None:
-            connection.execute(
-                "UPDATE training_sessions SET is_selected = 1 "
-                "WHERE id = (SELECT id FROM training_sessions ORDER BY created_at DESC LIMIT 1)"
-            )
+            newest = connection.execute(
+                "SELECT id FROM training_sessions ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if newest:
+                connection.execute(
+                    "UPDATE training_sessions SET is_selected = 1 WHERE id = ?",
+                    (newest["id"],),
+                )
 
 
 _init_database()
@@ -87,8 +145,10 @@ def _load_session_result(session_id):
 
 def _session_summary(row):
     result = json.loads(row["result"])
+    model_path = result.get("model_path")
     return {
         "id": row["id"],
+        "model_name": row["model_name"],
         "dataset_name": row["dataset_name"],
         "dataset_hash": row["dataset_hash"],
         "parameters": json.loads(row["parameters"]),
@@ -96,6 +156,7 @@ def _session_summary(row):
         "commodity_column": result.get("commodity_column"),
         "created_at": row["created_at"],
         "is_selected": bool(row["is_selected"]),
+        "available": bool(model_path and os.path.isfile(model_path)),
     }
 
 
@@ -116,7 +177,7 @@ def _resolve_upload_columns(df: pd.DataFrame, date_column: str, commodity_column
 
     date_candidates = []
     for column in df.columns:
-        parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
+        parsed = parse_date_series(df[column])
         if parsed.notna().mean() >= 0.8:
             date_candidates.append(column)
 
@@ -201,7 +262,7 @@ def get_columns():
             "total_rows": len(df),
         }
         for column in df.columns:
-            parsed = pd.to_datetime(df[column], dayfirst=True, errors="coerce")
+            parsed = parse_date_series(df[column])
             if parsed.notna().mean() >= 0.8:
                 response["date_column"] = column
                 values = parsed.dropna()
@@ -252,7 +313,7 @@ def upload():
         if commodity_column not in df.columns:
             return jsonify({"error": f"Kolom '{commodity_column}' tidak ditemukan."}), 400
 
-        df[date_column] = pd.to_datetime(df[date_column], dayfirst=True, errors="coerce")
+        df[date_column] = parse_date_series(df[date_column])
         df = df.dropna(subset=[date_column]).sort_values(date_column).reset_index(drop=True)
 
         start_date = request.form.get("start_date")
@@ -329,21 +390,20 @@ def descriptive():
 #   rf_profile ("Fast"|"Balanced"|"Thorough"), cv_splits (int)
 # ======================================================================
 
-def _run_training(session_id: str, df, date_column, commodity_column, kwargs):
+def _run_training(session_id: str, model_id: str, model_name: str, df, date_column, commodity_column, kwargs):
     try:
         result = train_model(
             df=df,
             date_column=date_column,
             commodity_column=commodity_column,
-            session_id=session_id,
+            session_id=model_id,
             **kwargs,
         )
         store = _get_store(session_id)
         store["train_result"] = {k: v for k, v in result.items() if k != "model"}
         store["train_status"] = "done"
-        model_session_id = str(uuid.uuid4())
         result_for_db = store["train_result"].copy()
-        result_for_db["model_path"] = result["model_path"]
+        result_for_db["model_path"] = os.path.abspath(result["model_path"])
         parameters = {
             "split_method": kwargs["split_method"],
             "train_ratio": kwargs["train_ratio"],
@@ -358,20 +418,24 @@ def _run_training(session_id: str, df, date_column, commodity_column, kwargs):
             )
             connection.execute(
                 "INSERT INTO training_sessions "
-                "(id, dataset_name, dataset_hash, parameters, result, created_at, is_selected) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                "(id, model_name, dataset_name, dataset_hash, parameters, result, created_at, is_selected) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                 (
-                    model_session_id,
-                    store.get("dataset_name", "dataset aktif"),
+                model_id,
+                model_name,
+                store.get("dataset_name", "dataset aktif"),
                     store.get("dataset_hash", ""),
                     json.dumps(parameters, default=str),
                     json.dumps(result_for_db, default=str),
                     created_at,
                 ),
             )
-        store["model_session_id"] = model_session_id
+        store["model_session_id"] = model_id
         _set_store(session_id, store)
     except Exception as e:
+        model_path = os.path.join(MODEL_DIR, f"{model_id}.joblib")
+        if os.path.isfile(model_path):
+            os.remove(model_path)
         store = _get_store(session_id)
         store["train_status"] = "error"
         store["train_error"] = str(e)
@@ -404,6 +468,10 @@ def train():
     if store.get("train_status") == "running":
         return jsonify({"message": "Training sedang berjalan.", "status": "running"}), 202
 
+    model_name = str(body.get("model_name", "")).strip()
+    if not model_name or len(model_name) > 255:
+        return jsonify({"error": "Nama model wajib diisi (maksimal 255 karakter)."}), 400
+
     try:
         df = pd.read_json(io.StringIO(store["df"]))
         date_column = store["date_column"]
@@ -421,10 +489,11 @@ def train():
             "rf_profile": body.get("rf_profile", "Balanced"),
             "cv_splits": int(body.get("cv_splits", 5)),
         }
+        model_id = str(uuid.uuid4())
 
         t = threading.Thread(
             target=_run_training,
-            args=(session_id, df, date_column, commodity_column, kwargs),
+            args=(session_id, model_id, model_name, df, date_column, commodity_column, kwargs),
             daemon=True,
         )
         t.start()
@@ -464,6 +533,9 @@ def select_session(session_id):
     result = _load_session_result(session_id)
     if result is None:
         return jsonify({"error": "Session training tidak ditemukan."}), 404
+    model_path = result.get("model_path")
+    if not model_path or not os.path.isfile(model_path):
+        return jsonify({"error": "File model tidak ditemukan di penyimpanan."}), 404
     with _db() as connection:
         connection.execute("UPDATE training_sessions SET is_selected = 0")
         connection.execute(
@@ -475,6 +547,7 @@ def select_session(session_id):
 
 @app.route("/sessions/<session_id>", methods=["DELETE"])
 def delete_session(session_id):
+    model_path = None
     with _db() as connection:
         row = connection.execute(
             "SELECT result FROM training_sessions WHERE id = ?", (session_id,)
@@ -483,15 +556,44 @@ def delete_session(session_id):
             return jsonify({"error": "Session training tidak ditemukan."}), 404
         connection.execute("DELETE FROM training_sessions WHERE id = ?", (session_id,))
         model_path = json.loads(row["result"]).get("model_path")
-        if model_path and os.path.isfile(model_path):
-            os.remove(model_path)
-        connection.execute(
-            "UPDATE training_sessions SET is_selected = 1 WHERE id = "
-            "(SELECT id FROM training_sessions ORDER BY created_at DESC LIMIT 1) "
-            "AND NOT EXISTS (SELECT 1 FROM training_sessions WHERE is_selected = 1)"
-        )
-    _store.pop(session_id, None)
+        selected = connection.execute(
+            "SELECT 1 FROM training_sessions WHERE is_selected = 1 LIMIT 1"
+        ).fetchone()
+        if not selected:
+            newest = connection.execute(
+                "SELECT id FROM training_sessions ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if newest:
+                connection.execute(
+                    "UPDATE training_sessions SET is_selected = 1 WHERE id = ?",
+                    (newest["id"],),
+                )
+    with _lock:
+        for upload_id, store in list(_store.items()):
+            if store.get("model_session_id") == session_id:
+                _store.pop(upload_id, None)
+    if model_path and os.path.isfile(model_path):
+        os.remove(model_path)
     return jsonify({"status": "deleted", "session_id": session_id})
+
+
+@app.route("/sessions/<session_id>/rename", methods=["POST"])
+def rename_session(session_id):
+    body = request.get_json(force=True) or {}
+    model_name = str(body.get("model_name", "")).strip()
+    if not model_name or len(model_name) > 255:
+        return jsonify({"error": "Nama model wajib diisi (maksimal 255 karakter)."}), 400
+    with _db() as connection:
+        existing = connection.execute(
+            "SELECT id FROM training_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not existing:
+            return jsonify({"error": "Model tidak ditemukan."}), 404
+        connection.execute(
+            "UPDATE training_sessions SET model_name = ? WHERE id = ?",
+            (model_name, session_id),
+        )
+    return jsonify({"status": "renamed", "session_id": session_id, "model_name": model_name})
 
 
 # ======================================================================
@@ -543,46 +645,58 @@ def output():
 # JSON body: session_id, data (list of {date, price})
 # ======================================================================
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    body = request.get_json(force=True) or {}
-    session_id = body.get("session_id")
-    store = _get_store(session_id)
-
-    if not store:
-        return jsonify({"error": "Session tidak ditemukan."}), 404
-
-    train_result = store.get("train_result")
-    if not train_result:
-        return jsonify({"error": "Model belum dilatih."}), 404
-
-    model_path = train_result.get("model_path")
-    if not model_path or not __import__("os").path.exists(model_path):
-        return jsonify({"error": "File model tidak ditemukan di disk."}), 404
-
+@app.route("/models/<session_id>/predict", methods=["POST"])
+def predict(session_id):
     try:
-        from core import make_time_series_features, MAX_LAG
-        import numpy as np
-
-        model = joblib.load(model_path)
-
-        raw_data = body.get("data", [])
-        if not raw_data:
-            return jsonify({"error": "Field 'data' wajib diisi."}), 400
-
-        df_input = pd.DataFrame(raw_data)
-        df_input["date"] = pd.to_datetime(df_input["date"])
-        df_input = df_input.sort_values("date").set_index("date")["price"].astype(float)
-
-        features = make_time_series_features(df_input, max_lag=MAX_LAG)
+        with _db() as connection:
+            row = connection.execute(
+                "SELECT result, model_name FROM training_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return jsonify({"error": "Model tidak ditemukan."}), 404
+        model_path = json.loads(row["result"]).get("model_path")
+        if not model_path or not os.path.isfile(model_path):
+            return jsonify({"error": "File model tidak ditemukan di penyimpanan."}), 404
+        if "file" not in request.files:
+            return jsonify({"error": "File dataset prediksi wajib diunggah."}), 400
+        file = request.files["file"]
+        filename = (file.filename or "").lower()
+        if filename.endswith(".csv"):
+            df = pd.read_csv(file)
+        elif filename.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(file)
+        else:
+            return jsonify({"error": "Format file tidak didukung. Gunakan CSV atau Excel."}), 400
+        date_column = request.form.get("date_column")
+        commodity_column = request.form.get("commodity_column")
+        if date_column not in df.columns or commodity_column not in df.columns:
+            return jsonify({"error": "Kolom tanggal atau harga tidak ditemukan."}), 400
+        df[date_column] = parse_date_series(df[date_column])
+        df[commodity_column] = clean_commodity_series(df, commodity_column)
+        df = df.dropna(subset=[date_column, commodity_column]).sort_values(date_column)
+        series = df.set_index(date_column)[commodity_column].astype(float)
+        series = series[~series.index.duplicated(keep="last")]
+        features = make_time_series_features(series, max_lag=MAX_LAG)
         X = features.drop(columns="target")
-
+        if X.empty:
+            return jsonify({
+                "error": f"Data tidak cukup untuk membentuk fitur. Unggah minimal {MAX_LAG + 1} observasi valid."
+            }), 400
+        model = joblib.load(model_path)
         preds = model.predict(X)
 
         return jsonify({
+            "model_id": session_id,
+            "model_name": row["model_name"],
+            "rows_used": len(X),
             "predictions": [
-                {"date": str(idx.date()), "predicted": float(p)}
-                for idx, p in zip(X.index, preds)
+                {
+                    "date": str(idx.date()),
+                    "actual": float(features.loc[idx, "target"]),
+                    "predicted": float(prediction),
+                }
+                for idx, prediction in zip(X.index, preds)
             ]
         })
 
@@ -596,7 +710,40 @@ def predict():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "PanganCast API"})
+    return jsonify({
+        "status": "ok",
+        "service": "PanganCast API",
+        "platform": "railway" if os.environ.get("RAILWAY_SERVICE_NAME") else "unknown",
+    })
+
+
+@app.route("/health/railway", methods=["GET"])
+def railway_health():
+    service_name = os.environ.get("RAILWAY_SERVICE_NAME")
+    environment_name = os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+    return jsonify({
+        "status": "ok",
+        "service": service_name or "PanganCast API",
+        "platform": "railway" if service_name else "unknown",
+        "environment": environment_name,
+    })
+
+
+@app.route("/health/database", methods=["GET"])
+def database_health():
+    try:
+        with _db() as connection:
+            result = connection.execute("SELECT 1 AS healthy").fetchone()
+        if not result or result.get("healthy") != 1:
+            raise RuntimeError("Database health query returned an unexpected result.")
+        return jsonify({"status": "ok", "service": "mysql"})
+    except Exception:
+        app.logger.exception("MySQL health check failed")
+        return jsonify({
+            "status": "error",
+            "service": "mysql",
+            "message": "Koneksi database gagal. Periksa konfigurasi dan log backend.",
+        }), 503
 
 
 if __name__ == "__main__":

@@ -8,17 +8,21 @@ PanganCast_flask/
 ├── requirements.txt
 ├── Procfile              ← untuk Railway / Heroku
 ├── gunicorn.conf.py      ← konfigurasi Gunicorn
-└── models/               ← folder model tersimpan (auto-created)
+└── models/               ← default folder model tersimpan
 ```
 
 ---
 
 ## Opsi 1: Railway (Rekomendasi, Gratis)
 
-1. Buat akun di https://railway.app
-2. Klik "New Project" → "Deploy from GitHub repo"
-3. Push folder `PanganCast_flask` ke GitHub
-4. Railway otomatis detect `Procfile` dan deploy
+1. Buat project untuk backend dan tambahkan **Volume** dengan mount path `/data`.
+2. Set environment variable berikut pada service backend:
+   - `DATABASE_URL`: URL MySQL dari Aiven, misalnya `mysql://user:password@host:port/database?ssl-mode=REQUIRED`.
+   - `MYSQL_SSL_CA`: path sertifikat CA Aiven yang tersedia di service (disarankan agar TLS memverifikasi sertifikat server).
+   - `PANGANCAST_MODEL_DIR`: `/data/models` agar file model berada di volume persisten Railway.
+3. Deploy service Flask dari GitHub. Pastikan volume terpasang pada service yang menjalankan Gunicorn.
+
+Tabel MySQL akan dibuat otomatis ketika backend mulai. Buat database di Aiven terlebih dahulu dan pastikan URL/CA cocok dengan konfigurasi Aiven. Password dengan karakter khusus harus di-URL-encode.
 
 File `Procfile` sudah disertakan:
 ```
@@ -30,10 +34,9 @@ Setelah deploy, Railway beri URL seperti:
 https://pangancast-backend.up.railway.app
 ```
 
-Ganti `kBaseUrl` di Flutter:
+Atur URL backend di Flutter:
 ```dart
-// lib/services/api_service.dart
-const String kBaseUrl = 'https://pangancast-backend.up.railway.app';
+const String kPrimaryBaseUrl = 'https://pangancast-backend.up.railway.app';
 ```
 
 ---
@@ -91,26 +94,44 @@ sudo systemctl start pangancast
 ```bash
 cd PanganCast_flask
 pip install -r requirements.txt
+# Atur DATABASE_URL ke database MySQL Aiven dan PANGANCAST_MODEL_DIR
+# ke direktori yang persisten/tersedia untuk menyimpan file model.
 python app.py
 # Server berjalan di http://localhost:5000
+```
+
+Di PowerShell, contoh konfigurasi lokal:
+```powershell
+$env:DATABASE_URL = "mysql://user:password@host:port/database?ssl-mode=REQUIRED"
+$env:MYSQL_SSL_CA = "C:\path\to\ca.pem"
+$env:PANGANCAST_MODEL_DIR = "C:\PanganCast\models"
+python app.py
 ```
 
 ---
 
 ## Catatan Penting
 
-- Folder `models/` harus bisa ditulis oleh server (writable)
+- Setiap model disimpan sebagai file `.joblib` dengan ID unik pada `PANGANCAST_MODEL_DIR`; metadata, nama, konfigurasi, dan tanggal training disimpan pada MySQL.
+- Gunakan Railway Volume atau storage persisten lain untuk `PANGANCAST_MODEL_DIR`. Tanpa volume, file model dapat hilang saat service dibuat ulang.
+- Semua backend (termasuk URL fallback Flutter) harus memakai database MySQL dan penyimpanan model yang sama agar failover tetap dapat menemukan file model.
+- Data lama pada SQLite lokal tidak dipindahkan otomatis ke Aiven. Model file lama perlu disalin ke volume dan metadata lama dimigrasikan secara terpisah jika ingin tetap digunakan.
 - Untuk production, tambahkan Nginx sebagai reverse proxy
-- Session disimpan in-memory — restart server = session hilang
-- Untuk persistent session, pertimbangkan Redis
+- Status proses upload/training yang sedang berjalan masih berada di memori; selesaikan training sebelum restart/deploy. Model training yang sudah selesai tetap dapat dipilih dan dipakai ulang setelah restart.
 
 ---
 
 ## Test Endpoint Setelah Deploy
 
 ```bash
-# Health check
+# Backend/API dapat dijangkau
 curl https://YOUR_URL/health
+
+# Memastikan aplikasi berjalan di Railway (menampilkan nama service/environment jika tersedia)
+curl https://YOUR_URL/health/railway
+
+# Menguji koneksi database MySQL Aiven
+curl -i https://YOUR_URL/health/database
 
 # Upload dataset
 curl -X POST https://YOUR_URL/upload \
@@ -118,3 +139,8 @@ curl -X POST https://YOUR_URL/upload \
   -F "date_column=Tanggal" \
   -F "commodity_column=Harga"
 ```
+
+Endpoint health dapat dipanggil bot Telegram dengan HTTP GET. `/health/railway`
+memeriksa bahwa service backend merespons; `/health/database` benar-benar
+menjalankan `SELECT 1` ke MySQL. Keduanya tidak mengembalikan kredensial. Respons
+database memakai HTTP 200 ketika tersambung dan HTTP 503 ketika koneksi gagal.

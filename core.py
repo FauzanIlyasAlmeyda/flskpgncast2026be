@@ -8,7 +8,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from scipy.stats import randint
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+MODEL_DIR = os.environ.get(
+    "PANGANCAST_MODEL_DIR", os.path.join(os.path.dirname(__file__), "models")
+)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
@@ -27,6 +29,19 @@ def clean_commodity_series(df: pd.DataFrame, commodity_column: str) -> pd.Series
         .replace(["-", "", "nan", "None"], np.nan)
     )
     return pd.to_numeric(cleaned, errors="coerce")
+
+
+def parse_date_series(values: pd.Series) -> pd.Series:
+    text = values.astype(str).str.strip()
+    iso_format = text.str.match(r"^\d{4}-\d{2}-\d{2}(?:[T ].*)?$")
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    parsed.loc[iso_format] = pd.to_datetime(
+        text.loc[iso_format], errors="coerce", utc=True
+    ).dt.tz_convert(None)
+    parsed.loc[~iso_format] = pd.to_datetime(
+        text.loc[~iso_format], dayfirst=True, errors="coerce", utc=True
+    ).dt.tz_convert(None)
+    return parsed
 
 
 # ======================================================================
@@ -128,7 +143,7 @@ def valid_tscv(n_samples, requested_splits):
 
 def descriptive_analysis(df: pd.DataFrame, date_column: str, commodity_column: str) -> dict:
     df = df.copy()
-    df[date_column] = pd.to_datetime(df[date_column], dayfirst=True, errors="coerce")
+    df[date_column] = parse_date_series(df[date_column])
     df = df.dropna(subset=[date_column]).sort_values(date_column)
     df[commodity_column] = clean_commodity_series(df, commodity_column)
     df = df.dropna(subset=[commodity_column])
@@ -180,7 +195,7 @@ def train_model(
     cv_splits: int = 5,
 ) -> dict:
     df = df.copy()
-    df[date_column] = pd.to_datetime(df[date_column], dayfirst=True, errors="coerce")
+    df[date_column] = parse_date_series(df[date_column])
     df[commodity_column] = clean_commodity_series(df, commodity_column)
     df = df.dropna(subset=[date_column, commodity_column]).sort_values(date_column)
 

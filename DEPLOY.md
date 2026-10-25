@@ -62,14 +62,20 @@ container dibuat ulang.
 
 1. Pasang Docker Engine dan Docker Compose plugin di VPS.
 2. Salin folder `PanganCast_flask` ke VPS, lalu masuk ke folder tersebut.
-3. Buat file `.env` dari template dan ganti kedua password dengan nilai acak
-   yang panjang, berbeda, dan hanya memakai huruf/angka agar aman dimasukkan ke
+3. Siapkan `.env` pada VPS. Anda bisa menyalin `.env` lokal melalui SCP/SSH
+   (jangan commit atau kirim lewat chat), atau membuatnya langsung dari template
+   di VPS. Jika membuatnya di VPS, ganti kedua password dengan nilai acak yang
+   panjang, berbeda, dan hanya memakai huruf/angka agar aman dimasukkan ke
    `DATABASE_URL`:
 
    ```bash
    cp .env.example .env
    nano .env
+   chmod 600 .env
    ```
+
+   Jika `.env` lokal sudah disalin ke VPS, lewati `cp` dan `nano`, lalu jalankan
+   `chmod 600 .env`.
 
 4. Jalankan layanan:
 
@@ -82,14 +88,49 @@ container dibuat ulang.
 5. Verifikasi backend dan database dari VPS:
 
    ```bash
-   curl http://127.0.0.1:8080/health
-   curl -i http://127.0.0.1:8080/health/database
+   curl http://127.0.0.1:8083/health
+   curl -i http://127.0.0.1:8083/health/database
    ```
 
-Port API hanya di-bind ke `127.0.0.1`, sedangkan MySQL tidak dipublikasikan
-ke internet. Pasang Nginx atau Caddy di VPS sebagai reverse proxy HTTPS ke
-`127.0.0.1:8080`, lalu gunakan URL HTTPS publik tersebut di aplikasi Flutter.
-Jangan membuka port MySQL `3306` ke publik.
+API memakai port host `8083` (port `8082` yang sudah dipakai tetap tidak
+berubah), dan hanya di-bind ke `127.0.0.1`. MySQL berjalan di Docker dan tidak
+dipublikasikan ke internet.
+
+### Nginx host dan HTTPS
+
+Domain backend: `flask.fauzanilyasalmeyda.my.id`. Konfigurasi reverse proxy
+tersedia di `deploy/nginx/pangancast.conf`; upstream-nya adalah
+`http://127.0.0.1:8083`.
+
+Sebelum memasang konfigurasi, periksa apakah domain sudah memiliki server block
+Nginx. Jangan membuat server block duplikat untuk hostname yang sama; jika
+sudah ada, ubah `proxy_pass` pada konfigurasi yang ada menjadi
+`http://127.0.0.1:8083` dan pertahankan pengaturan HTTPS yang sudah berfungsi.
+Jika belum ada:
+
+```bash
+sudo cp deploy/nginx/pangancast.conf /etc/nginx/sites-available/pangancast
+sudo ln -s /etc/nginx/sites-available/pangancast /etc/nginx/sites-enabled/pangancast
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Jika sertifikat untuk domain belum terpasang, pasang Certbot beserta plugin
+Nginx sesuai distribusi Linux VPS, lalu jalankan:
+
+```bash
+sudo certbot --nginx -d flask.fauzanilyasalmeyda.my.id --redirect
+```
+
+Uji endpoint publik:
+
+```bash
+curl -i https://flask.fauzanilyasalmeyda.my.id/health
+curl -i https://flask.fauzanilyasalmeyda.my.id/health/database
+```
+
+Pastikan firewall VPS mengizinkan HTTP/HTTPS (80/443). Jangan membuka port
+`8083` atau MySQL `3306` untuk akses publik; Nginx mengakses API lewat localhost.
 
 Volume yang digunakan:
 

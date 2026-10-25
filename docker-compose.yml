@@ -30,7 +30,7 @@ services:
       DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}
       PANGANCAST_MODEL_DIR: /data/models
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8083:8080"
     volumes:
       - model_data:/data/models
       - app_data:/app/data

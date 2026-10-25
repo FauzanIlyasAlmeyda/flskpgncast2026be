@@ -8,6 +8,8 @@ PanganCast_flask/
 ├── requirements.txt
 ├── Procfile              ← untuk Railway / Heroku
 ├── gunicorn.conf.py      ← konfigurasi Gunicorn
+├── Dockerfile
+├── docker-compose.yml
 └── models/               ← default folder model tersimpan
 ```
 
@@ -52,7 +54,67 @@ const String kPrimaryBaseUrl = 'https://pangancast-backend.up.railway.app';
 
 ---
 
-## Opsi 3: VPS / Server Sendiri
+## Opsi 3: VPS dengan Docker Compose
+
+Backend dan MySQL dijalankan sebagai container terpisah. Data MySQL, file model,
+dan dataset aktif memakai Docker named volume sehingga tetap ada setelah
+container dibuat ulang.
+
+1. Pasang Docker Engine dan Docker Compose plugin di VPS.
+2. Salin folder `PanganCast_flask` ke VPS, lalu masuk ke folder tersebut.
+3. Buat file `.env` dari template dan ganti kedua password dengan nilai acak
+   yang panjang, berbeda, dan hanya memakai huruf/angka agar aman dimasukkan ke
+   `DATABASE_URL`:
+
+   ```bash
+   cp .env.example .env
+   nano .env
+   ```
+
+4. Jalankan layanan:
+
+   ```bash
+   docker compose up -d --build
+   docker compose ps
+   docker compose logs -f api
+   ```
+
+5. Verifikasi backend dan database dari VPS:
+
+   ```bash
+   curl http://127.0.0.1:8080/health
+   curl -i http://127.0.0.1:8080/health/database
+   ```
+
+Port API hanya di-bind ke `127.0.0.1`, sedangkan MySQL tidak dipublikasikan
+ke internet. Pasang Nginx atau Caddy di VPS sebagai reverse proxy HTTPS ke
+`127.0.0.1:8080`, lalu gunakan URL HTTPS publik tersebut di aplikasi Flutter.
+Jangan membuka port MySQL `3306` ke publik.
+
+Volume yang digunakan:
+
+- `mysql_data`: database MySQL dan tabel `training_sessions`.
+- `model_data`: file model `.joblib`.
+- `app_data`: dataset aktif yang disimpan backend.
+
+Untuk melihat nama volume aktual: `docker volume ls`. Backup volume database dan
+model secara berkala; jangan menghapus volume saat memperbarui container. Model
+lama hanya bisa digunakan jika file `.joblib` beserta metadata barisnya pada
+`training_sessions` ikut dipindahkan. Path file model tersimpan di metadata,
+jadi pemindahan model ke direktori berbeda mungkin memerlukan pembaruan metadata.
+
+Perintah operasional:
+
+```bash
+docker compose logs -f api
+docker compose restart api
+docker compose down
+```
+
+`docker compose down` mempertahankan volume. Hindari `docker compose down -v`
+karena opsi `-v` menghapus database, model, dan dataset persisten.
+
+## Opsi 4: VPS / Server Sendiri (tanpa Docker)
 
 ```bash
 # Install dependencies
@@ -89,7 +151,7 @@ sudo systemctl start pangancast
 
 ---
 
-## Opsi 4: Lokal (Development)
+## Opsi 5: Lokal (Development)
 
 ```bash
 cd PanganCast_flask
